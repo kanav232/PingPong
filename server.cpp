@@ -26,6 +26,28 @@ constexpr float PUCK_SPEED = 25.0f;
 constexpr int MAX_SCORE = 20;
 
 #pragma pack(push,1)
+string get_local_ip() {
+    // This works inside WSL, Linux, and Windows-MinGW
+    char buf[256];
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    sockaddr_in tmp{};
+    tmp.sin_family = AF_INET;
+    tmp.sin_addr.s_addr = inet_addr("8.8.8.8"); 
+    tmp.sin_port = htons(53);
+
+    connect(sock, (sockaddr*)&tmp, sizeof(tmp));
+
+    sockaddr_in name{};
+    socklen_t len = sizeof(name);
+    getsockname(sock, (sockaddr*)&name, &len);
+
+    close(sock);
+
+    inet_ntop(AF_INET, &name.sin_addr, buf, sizeof(buf));
+    return string(buf);
+}
+
 struct InputMsg {
     uint8_t type;  // 1 = JOIN, 2 = INPUT
     uint8_t dir;   // 0 stop, 1 up, 2 down
@@ -159,6 +181,9 @@ void send_state() {
 
 int main() {
     cout << "=== PingPong Arena Server ===\n";
+
+    string ip = get_local_ip();
+    cout << "[server] Running at: " << ip << ":" << SERVER_PORT << "\n";
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
