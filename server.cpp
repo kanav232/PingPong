@@ -1,253 +1,249 @@
-// server.cpp
-// C++ UDP authoritative air-hockey server (ASCII clients)
-// Compile: g++ -std=c++17 -O2 -pthread server.cpp -o server
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
-#include <thread>
-#include <atomic>
-#include <vector>
-#include <chrono>
 #include <mutex>
+#include <random>
+#include <thread>
+using namespace std;
+using namespace chrono;
 
-using namespace std::chrono;
+constexpr int SERVER_PORT = 5000;
+constexpr int TICKS_PER_SEC = 60;
+constexpr float DT = 1.0f / TICKS_PER_SEC;
 
-const int PORT = 40000;
-const int TICKS_PER_SEC = 60;
-const float DT = 1.0f / TICKS_PER_SEC;
-
-const int FIELD_W = 80;
-const int FIELD_H = 24;
-const float PADDLE_H = 4.0f;
-const float PADDLE_SPEED = 20.0f; // units per second
-const float PUCK_SPEED_INIT = 20.0f;
+constexpr int W = 80;
+constexpr int H = 24;
+constexpr float PADDLE_H = 4.0f;
+constexpr float PADDLE_SPEED = 26.0f;
+constexpr float PUCK_SPEED = 25.0f;
+constexpr int MAX_SCORE = 20;
 
 #pragma pack(push,1)
 struct InputMsg {
-    uint8_t type; // 1 join, 2 input
-    uint8_t dir;  // 0 none,1 up,2 down
+    uint8_t type;  // 1 = JOIN, 2 = INPUT
+    uint8_t dir;   // 0 stop, 1 up, 2 down
     uint32_t seq;
 };
+struct AssignMsg {
+    uint8_t type;      // 5
+    uint8_t player_id; // 1 or 2
+};
 struct StateMsg {
-    uint8_t type; // 10
+    uint8_t type;  
     uint8_t your_id;
-    uint16_t tick;
+    uint32_t tick;
+
     float puck_x, puck_y;
     float puck_vx, puck_vy;
+
     float pad1_y, pad2_y;
+
     uint8_t score1, score2;
+    uint8_t gameOver; // 0=playing 1=P1 won 2=P2 won
 };
 #pragma pack(pop)
 
-struct PlayerAddr {
-    sockaddr_in addr;
-    bool valid=false;
+struct Player {
+    bool active = false;
+    sockaddr_in addr{};
+    uint8_t dir = 0;
+    uint32_t last_seq = 0;
 };
 
+Player P[2];
 int sockfd;
-PlayerAddr players[2];
-std::mutex addr_mtx;
+mutex mtx;
 
-std::atomic<uint16_t> server_tick{0};
+atomic<uint32_t> TICK{0};
 
+// GAME STATE
 float padY[2];
 float puck_x, puck_y, puck_vx, puck_vy;
-uint8_t score1=0, score2=0;
+uint8_t score1 = 0, score2 = 0;
+uint8_t gameOver = 0;
 
-void bind_socket() {
+mt19937 rng((unsigned)time(nullptr));
+
+void reset_ball(int dir) {
+    puck_x = W/2;
+    puck_y = H/2;
+    puck_vx = PUCK_SPEED * dir;
+    puck_vy = (uniform_real_distribution<float>(-1.2,1.2))(rng);
+}
+
+void send_assign(Player &pl) {
+    AssignMsg a{5, pl.active ? (pl.addr.sin_port?1:2) : 0};
+    // actually correct id from index
+}
+
+void recv_thread() {
+    while (true) {
+        uint8_t buf[64];
+        sockaddr_in cli{};
+        socklen_t sl = sizeof(cli);
+        ssize_t r = recvfrom(sockfd, buf, sizeof(buf), 0, (sockaddr*)&cli, &sl);
+        if (r <= 0) { this_thread::sleep_for(1ms); continue; }
+
+        if (r < (ssize_t)sizeof(InputMsg)) continue;
+
+        InputMsg in;
+        memcpy(&in, buf, sizeof(in));
+
+        if (in.type == 1) { // JOIN
+            lock_guard<mutex> g(mtx);
+            for (int i=0;i<2;i++) {
+                if (!P[i].active) {
+                    P[i].active = true;
+                    P[i].addr = cli;
+                    P[i].dir = 0;
+                    P[i].last_seq = 0;
+
+                    AssignMsg a{5, (uint8_t)(i+1)};
+                    sendto(sockfd, &a, sizeof(a), 0, (sockaddr*)&cli, sl);
+                    cerr << "[server] Assigned player " << (i+1)
+                         << " (" << inet_ntoa(cli.sin_addr) << ":" << ntohs(cli.sin_port) << ")\n";
+                    break;
+                }
+            }
+        }
+        else if (in.type == 2) { // INPUT
+            lock_guard<mutex> g(mtx);
+            for (int i=0;i<2;i++) {
+                if (P[i].active &&
+                    P[i].addr.sin_addr.s_addr == cli.sin_addr.s_addr &&
+                    P[i].addr.sin_port == cli.sin_port) {
+
+                    if (in.seq > P[i].last_seq) {
+                        P[i].last_seq = in.seq;
+                        P[i].dir = in.dir;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void send_state() {
+    lock_guard<mutex> g(mtx);
+    for (int i=0;i<2;i++) {
+        if (!P[i].active) continue;
+
+        StateMsg s{};
+        s.type = 10;
+        s.your_id = i+1;
+        s.tick = TICK.load();
+
+        s.puck_x = puck_x;
+        s.puck_y = puck_y;
+        s.puck_vx = puck_vx;
+        s.puck_vy = puck_vy;
+
+        s.pad1_y = padY[0];
+        s.pad2_y = padY[1];
+
+        s.score1 = score1;
+        s.score2 = score2;
+        s.gameOver = gameOver;
+
+        sendto(sockfd, &s, sizeof(s), 0,
+               (sockaddr*)&P[i].addr, sizeof(P[i].addr));
+    }
+}
+
+int main() {
+    cout << "=== PingPong Arena Server ===\n";
+
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) { perror("socket"); exit(1); }
+
     sockaddr_in serv{};
     serv.sin_family = AF_INET;
+    serv.sin_port = htons(SERVER_PORT);
     serv.sin_addr.s_addr = INADDR_ANY;
-    serv.sin_port = htons(PORT);
-    if (bind(sockfd, (sockaddr*)&serv, sizeof(serv)) < 0) { perror("bind"); exit(1); }
-    // make non-blocking if desired: but we'll use recvfrom with MSG_DONTWAIT occasionally
-}
 
-void handle_packets() {
-    while (true) {
-        sockaddr_in cli{};
-        socklen_t len = sizeof(cli);
-        InputMsg in;
-        ssize_t r = recvfrom(sockfd, &in, sizeof(in), MSG_DONTWAIT, (sockaddr*)&cli, &len);
-        if (r <= 0) { std::this_thread::sleep_for(milliseconds(1)); continue; }
-        if (in.type == 1) { // JOIN
-            std::lock_guard<std::mutex> g(addr_mtx);
-            // assign to first empty slot
-            for (int i=0;i<2;i++){
-                if (!players[i].valid) {
-                    players[i].addr = cli;
-                    players[i].valid = true;
-                    std::cout<<"Assigned player "<<(i+1)<<" to "<<inet_ntoa(cli.sin_addr)<<":"<<ntohs(cli.sin_port)<<"\n";
-                    break;
-                }
-            }
-        } else if (in.type == 2) {
-            // find which player
-            std::lock_guard<std::mutex> g(addr_mtx);
-            for (int i=0;i<2;i++){
-                if (players[i].valid &&
-                    players[i].addr.sin_addr.s_addr == cli.sin_addr.s_addr &&
-                    players[i].addr.sin_port == cli.sin_port) {
-                    // apply direct immediate movement influence (store dir into padY control array)
-                    float dy = 0.0f;
-                    if (in.dir == 1) dy = -PADDLE_SPEED;
-                    else if (in.dir == 2) dy = PADDLE_SPEED;
-                    // we'll integrate in physics loop by storing desired speed in padY as velocity
-                    // But to keep it simple: we attach dir into padY by a small velocity mark in a secondary array
-                    // We'll use padYVel to hold last input influence (in a real build you may queue inputs)
-                    // For simplicity, store dir in seq field? No—use a small table:
-                    // For this starter, we'll simply set a signed flag in seq (not ideal) — instead use global flags:
-                    // We'll implement padDir array (0/1/2)
-                }
-            }
-        }
-    }
-}
+    bind(sockfd, (sockaddr*)&serv, sizeof(serv));
 
-// We'll store last direction per player in padDir
-int padDir[2] = {0,0};
+    thread t(recv_thread);
+    t.detach();
 
-void packet_receiver_thread() {
-    while (true) {
-        sockaddr_in cli{};
-        socklen_t len = sizeof(cli);
-        uint8_t buf[64];
-        ssize_t r = recvfrom(sockfd, buf, sizeof(buf), 0, (sockaddr*)&cli, &len);
-        if (r <= 0) { std::this_thread::sleep_for(milliseconds(1)); continue; }
-        InputMsg in;
-        if (r >= (ssize_t)sizeof(InputMsg)) memcpy(&in, buf, sizeof(InputMsg));
-        else continue;
-        if (in.type == 1) {
-            std::lock_guard<std::mutex> g(addr_mtx);
-            for (int i=0;i<2;i++){
-                if (!players[i].valid) {
-                    players[i].addr = cli;
-                    players[i].valid = true;
-                    std::cout << "Player " << (i+1) << " joined from " << inet_ntoa(cli.sin_addr) << ":" << ntohs(cli.sin_port) << "\n";
-                    break;
-                }
-            }
-        } else if (in.type == 2) {
-            std::lock_guard<std::mutex> g(addr_mtx);
-            for (int i=0;i<2;i++){
-                if (players[i].valid &&
-                    players[i].addr.sin_addr.s_addr == cli.sin_addr.s_addr &&
-                    players[i].addr.sin_port == cli.sin_port) {
-                    padDir[i] = in.dir;
-                }
-            }
-        }
-    }
-}
+    cout << "Waiting for 2 players...\n";
+    while (!(P[0].active && P[1].active)) 
+        this_thread::sleep_for(50ms);
 
-void send_state_to_all() {
-    StateMsg st{};
-    st.type = 10;
-    st.tick = server_tick.load();
-    st.puck_x = puck_x;
-    st.puck_y = puck_y;
-    st.puck_vx = puck_vx;
-    st.puck_vy = puck_vy;
-    st.pad1_y = padY[0];
-    st.pad2_y = padY[1];
-    st.score1 = score1;
-    st.score2 = score2;
-    // send separately to each valid player, setting your_id appropriately
-    std::lock_guard<std::mutex> g(addr_mtx);
-    for (int i=0;i<2;i++){
-        if (!players[i].valid) continue;
-        st.your_id = (uint8_t)(i+1);
-        sendto(sockfd, &st, sizeof(st), 0, (sockaddr*)&players[i].addr, sizeof(players[i].addr));
-    }
-}
+    cout << "Players ready. Game starting...\n";
 
-void reset_positions() {
-    padY[0] = FIELD_H/2.0f;
-    padY[1] = FIELD_H/2.0f;
-    puck_x = FIELD_W/2.0f;
-    puck_y = FIELD_H/2.0f;
-    // initial velocity to a random side
-    puck_vx = (rand()%2?1:-1) * PUCK_SPEED_INIT;
-    puck_vy = ((rand()%200)-100)/100.0f * 5.0f;
-}
+    padY[0] = padY[1] = H/2;
+    reset_ball((uniform_int_distribution<int>(0,1)(rng)?1:-1));
 
-int main(){
-    srand(time(nullptr));
-    bind_socket();
-    std::thread recv_t(packet_receiver_thread);
-    recv_t.detach();
-
-    // initialize
-    padY[0] = FIELD_H/2.0f;
-    padY[1] = FIELD_H/2.0f;
-    reset_positions();
-
-    auto next_tick = high_resolution_clock::now();
+    auto next = steady_clock::now();
 
     while (true) {
-        next_tick += milliseconds(1000 / TICKS_PER_SEC);
-        // integrate inputs into paddles
-        for (int i=0;i<2;i++){
-            float vel = 0.0f;
-            if (padDir[i] == 1) vel = -PADDLE_SPEED;
-            else if (padDir[i] == 2) vel = PADDLE_SPEED;
-            padY[i] += vel * DT;
-            // clamp
-            if (padY[i] < PADDLE_H/2.0f) padY[i] = PADDLE_H/2.0f;
-            if (padY[i] > FIELD_H - PADDLE_H/2.0f) padY[i] = FIELD_H - PADDLE_H/2.0f;
+        next += milliseconds(1000/TICKS_PER_SEC);
+
+        // update paddles
+        {
+            lock_guard<mutex> g(mtx);
+            for (int i=0;i<2;i++) {
+                if (P[i].dir == 1) padY[i] -= PADDLE_SPEED * DT;
+                if (P[i].dir == 2) padY[i] += PADDLE_SPEED * DT;
+
+                float half = PADDLE_H/2;
+                if (padY[i] < half) padY[i] = half;
+                if (padY[i] > H-1-half) padY[i] = H-1-half;
+            }
         }
 
         // update puck
         puck_x += puck_vx * DT;
         puck_y += puck_vy * DT;
 
-        // top/bottom bounce
-        if (puck_y < 0.5f) { puck_y = 0.5f; puck_vy = -puck_vy; }
-        if (puck_y > FIELD_H - 0.5f) { puck_y = FIELD_H - 0.5f; puck_vy = -puck_vy; }
+        if (puck_y < 1) { puck_y=1; puck_vy=-puck_vy; }
+        if (puck_y > H-2) { puck_y=H-2; puck_vy=-puck_vy; }
 
-        // left paddle collision (x near 2)
-        if (puck_x <= 2.5f) {
-            float rel = puck_y - padY[0];
-            if (std::abs(rel) <= PADDLE_H/2.0f) {
-                // reflect with slight influence
-                puck_x = 2.5f;
-                puck_vx = -puck_vx;
-                puck_vy += rel * 2.0f; // add spin
+        // paddle collisions
+        // left
+        if (puck_x <= 3) {
+            if (fabs(puck_y - padY[0]) <= PADDLE_H/2 + 0.5f) {
+                puck_x=3;
+                puck_vx = fabs(puck_vx);
             } else {
-                // goal to right
                 score2++;
-                reset_positions();
+                if (score2 >= MAX_SCORE) { gameOver = 2; }
+                reset_ball(1);
             }
         }
-
-        // right paddle collision (x near FIELD_W-2)
-        if (puck_x >= FIELD_W - 2.5f) {
-            float rel = puck_y - padY[1];
-            if (std::abs(rel) <= PADDLE_H/2.0f) {
-                puck_x = FIELD_W - 2.5f;
-                puck_vx = -puck_vx;
-                puck_vy += rel * 2.0f;
+        // right
+        if (puck_x >= W-4) {
+            if (fabs(puck_y - padY[1]) <= PADDLE_H/2 + 0.5f) {
+                puck_x=W-4;
+                puck_vx = -fabs(puck_vx);
             } else {
-                // goal to left
                 score1++;
-                reset_positions();
+                if (score1 >= MAX_SCORE) { gameOver = 1; }
+                reset_ball(-1);
             }
         }
 
-        // small friction to avoid runaway
-        puck_vx *= 1.0f;
-        puck_vy *= 0.999f;
+        TICK++;
+        send_state();
 
-        // increment tick and send state
-        server_tick++;
-        send_state_to_all();
+        if (gameOver != 0) break;
 
-        std::this_thread::sleep_until(next_tick);
+        this_thread::sleep_until(next);
+    }
+
+    cerr << "Game finished. Winner = Player " << (int)gameOver << "\n";
+
+    // send final state for a bit
+    for (int i=0;i<120;i++) {
+        send_state();
+        this_thread::sleep_for(16ms);
     }
 
     close(sockfd);
